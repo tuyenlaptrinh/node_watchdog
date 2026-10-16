@@ -1,0 +1,378 @@
+<style>
+.nw-main { position: relative; height: 640px; }
+.nw-main .bt-w-menu { position: absolute; left: 0; top: 0; bottom: 0; width: 130px; }
+.nw-main .bt-w-con { position: absolute; left: 130px; right: 0; top: 0; bottom: 0; overflow: auto; }
+.nw-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.nw-toolbar .nw-meta > span { margin-right: 18px; color: #666; }
+.nw-toolbar .btn { margin-left: 6px; }
+.nw-badge { display: inline-block; padding: 0 8px; line-height: 20px; border-radius: 10px; font-size: 12px; color: #fff; }
+.nw-ok { background: #20a53a; }
+.nw-bad { background: #ef0808; }
+.nw-gray { background: #999; }
+.nw-alert { padding: 8px 12px; margin-bottom: 12px; border: 1px solid #faebcc; background: #fcf8e3; color: #8a6d3b; border-radius: 3px; }
+.nw-form .line { padding: 6px 0; display: flex; align-items: center; }
+.nw-form .tname { width: 180px; flex-shrink: 0; text-align: right; padding-right: 12px; color: #555; }
+.nw-form .bt-input-text { width: 330px; height: 30px; line-height: 30px; padding: 0 8px; }
+.nw-form .nw-short { width: 120px; }
+.nw-form .nw-help { margin: -2px 0 4px 192px; color: #999; font-size: 12px; }
+.nw-form h3 { font-size: 14px; margin: 16px 0 8px; padding-bottom: 6px; border-bottom: 1px solid #eee; }
+.nw-form h3:first-child { margin-top: 0; }
+.nw-form label { font-weight: normal; margin: 0; cursor: pointer; }
+.nw-actions { margin: 16px 0 0 192px; }
+.nw-actions .btn { margin-right: 8px; }
+.nw-table td, .nw-table th { vertical-align: middle !important; }
+.nw-detail { white-space: pre-wrap; word-break: break-all; max-width: 420px; font-size: 12px; }
+.nw-err { color: #ef0808; }
+.nw-warn { color: #c87f0a; }
+.nw-muted { color: #999; }
+.nw-email { max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+</style>
+
+<div class="bt-form">
+    <div class="bt-w-main nw-main">
+        <div class="bt-w-menu nw-menu">
+            <p class="bgw" data-tab="projects">Projects</p>
+            <p data-tab="email">Email / SMTP</p>
+            <p data-tab="settings">Settings</p>
+            <p data-tab="events">Event log</p>
+        </div>
+        <div class="bt-w-con pd15">
+            <div id="nw_body"></div>
+        </div>
+    </div>
+</div>
+
+<script type="text/javascript">
+var node_watchdog = {
+    plugin: 'node_watchdog',
+    current: 'projects',
+    projects: [],
+
+    request: function (method, args, callback, loading) {
+        var idx = loading === false ? null : layer.msg(loading || 'Loading...', { icon: 16, time: 0, shade: 0.3 });
+        $.ajax({
+            type: 'POST',
+            url: '/plugin?action=a&name=' + this.plugin + '&s=' + method,
+            data: args || {},
+            dataType: 'json',
+            timeout: 120000,
+            success: function (res) {
+                if (idx !== null) layer.close(idx);
+                if (callback) return callback(res);
+                node_watchdog.notify(res);
+            },
+            error: function (xhr) {
+                if (idx !== null) layer.close(idx);
+                layer.msg('Request failed: ' + (xhr.status || '') + ' ' + (xhr.statusText || ''), { icon: 2 });
+            }
+        });
+    },
+
+    notify: function (res, onSuccess) {
+        layer.msg(res.msg, { icon: res.status ? 1 : 2, time: res.status ? 2000 : 6000 });
+        if (res.status && onSuccess) onSuccess();
+    },
+
+    esc: function (s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+    },
+
+    b64: function (s) { return btoa(unescape(encodeURIComponent(s))); },
+
+    fmt_time: function (ts) {
+        if (!ts) return '-';
+        var d = new Date(ts * 1000), p = function (n) { return (n < 10 ? '0' : '') + n; };
+        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+            p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    },
+
+    ago: function (ts) {
+        var s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+        if (s < 60) return s + 's ago';
+        if (s < 3600) return Math.floor(s / 60) + 'm ago';
+        if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm ago';
+        return Math.floor(s / 86400) + 'd ago';
+    },
+
+    line: function (label, input, help) {
+        return '<div class="line"><span class="tname">' + label + '</span>' + input + '</div>' +
+            (help ? '<div class="nw-help">' + help + '</div>' : '');
+    },
+
+    checkbox: function (id, checked, text) {
+        return '<label><input type="checkbox" id="' + id + '"' + (checked ? ' checked' : '') + '> ' + text + '</label>';
+    },
+
+    badge: function (cls, text) { return '<span class="nw-badge ' + cls + '">' + text + '</span>'; },
+
+    tab: function (name) {
+        this.current = name;
+        $('.nw-menu p').removeClass('bgw').filter('[data-tab="' + name + '"]').addClass('bgw');
+        this['render_' + name]();
+    },
+
+    fail: function (res) {
+        $('#nw_body').html('<div class="nw-alert">' + this.esc(res.msg) + '</div>');
+    },
+
+    /* ------------------------------------------------------------ Projects */
+    render_projects: function () {
+        var self = this;
+        self.request('get_overview', {}, function (res) {
+            if (!res.status) return self.fail(res);
+            var d = res.data, html = '';
+            self.projects = d.projects;
+            if (!d.smtp_ready) {
+                html += '<div class="nw-alert">SMTP is not configured yet, so alerts cannot be sent. ' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.tab(\'email\')">Configure SMTP</a></div>';
+            } else if (!d.default_email) {
+                html += '<div class="nw-alert">No default email is set. Projects without their own email will not be notified. ' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.tab(\'email\')">Set default email</a></div>';
+            }
+            if (!d.service.running) {
+                html += '<div class="nw-alert">The watchdog service is not running, so projects are not being monitored. ' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.service(\'start\')">Start it now</a></div>';
+            }
+            if (d.pending_emails) {
+                html += '<div class="nw-alert">' + d.pending_emails + ' alert email(s) are waiting to be retried. ' +
+                    'See the <a class="btlink" href="javascript:;" onclick="node_watchdog.tab(\'events\')">event log</a>.</div>';
+            }
+            html += '<div class="nw-toolbar"><div class="nw-meta">' +
+                '<span>Service: ' + (d.service.running ? self.badge('nw-ok', 'Running') : self.badge('nw-bad', 'Stopped')) + '</span>' +
+                '<span>Last check: ' + (d.last_check ? self.ago(d.last_check) : 'never') + '</span>' +
+                '<span>Default email: ' + (d.default_email ? self.esc(d.default_email) : '<i>not set</i>') + '</span>' +
+                '</div><div><button class="btn btn-default btn-sm" onclick="node_watchdog.render_projects()">Refresh</button></div></div>';
+
+            html += '<div class="divtable"><table class="table table-hover nw-table"><thead><tr>' +
+                '<th>Project</th><th>Status</th><th>PID</th><th>Memory</th><th>Monitor</th><th>Alert email</th>' +
+                '<th style="text-align:right">Action</th></tr></thead><tbody>';
+            if (!d.projects.length) {
+                html += '<tr><td colspan="7" style="text-align:center">No Node.js projects found in aaPanel</td></tr>';
+            }
+            $.each(d.projects, function (i, p) {
+                var status = p.running ? self.badge('nw-ok', 'Running')
+                    : p.crashed ? self.badge('nw-bad', 'Crashed') + '<br><small class="nw-muted">' + self.ago(p.down_since) + '</small>'
+                    : self.badge('nw-gray', 'Stopped');
+                var email = p.email ? self.esc(p.email)
+                    : '<span class="nw-muted">Default' + (p.recipients.length ? '' : ' (none set)') + '</span>';
+                html += '<tr>' +
+                    '<td><b>' + self.esc(p.name) + '</b>' +
+                    (p.ps && p.ps !== p.name ? '<br><small class="nw-muted">' + self.esc(p.ps) + '</small>' : '') + '</td>' +
+                    '<td>' + status + '</td>' +
+                    '<td>' + (p.running ? p.pid : '-') + '</td>' +
+                    '<td>' + (p.running ? p.memory : '-') + '</td>' +
+                    '<td>' + (p.enabled ? self.badge('nw-ok', 'On') : self.badge('nw-gray', 'Off')) + '</td>' +
+                    '<td><span class="nw-email" title="' + self.esc(p.recipients.join(', ')) + '">' + email + '</span></td>' +
+                    '<td style="text-align:right;white-space:nowrap">' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.edit_project(' + i + ')">Settings</a> | ' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.test_project(' + i + ')">Test alert</a></td>' +
+                    '</tr>';
+            });
+            html += '</tbody></table></div>';
+            $('#nw_body').html(html);
+        });
+    },
+
+    edit_project: function (i) {
+        var self = this, p = self.projects[i];
+        layer.open({
+            type: 1,
+            title: 'Alert settings - ' + self.esc(p.name),
+            area: '640px',
+            closeBtn: 2,
+            btn: ['Save', 'Cancel'],
+            content: '<div class="bt-form pd20 nw-form">' +
+                self.line('Monitor', self.checkbox('nw_p_enabled', p.enabled, 'Send an email when this project stops')) +
+                self.line('Alert email', '<input class="bt-input-text" id="nw_p_email" value="' + self.esc(p.email) +
+                    '" placeholder="Empty = use the default email">', 'Separate multiple addresses with commas.') +
+                self.line('Log file', '<input class="bt-input-text" id="nw_p_log" value="' + self.esc(p.log_file) +
+                    '" placeholder="Auto-detect">',
+                    'Empty = auto-detect: ' + self.esc(p.detected_log) +
+                    (p.detected_log_exists ? '' : ' <span class="nw-err">(not found)</span>')) +
+                '</div>',
+            yes: function (index) {
+                self.request('save_project', {
+                    project: p.name,
+                    enabled: $('#nw_p_enabled').prop('checked') ? 1 : 0,
+                    email: $('#nw_p_email').val(),
+                    log_file: $('#nw_p_log').val()
+                }, function (res) {
+                    self.notify(res, function () { layer.close(index); self.render_projects(); });
+                }, 'Saving...');
+            }
+        });
+    },
+
+    test_project: function (i) {
+        var self = this, p = self.projects[i];
+        if (!p.recipients.length) return layer.msg('No recipient: set a default email or an email for this project', { icon: 2 });
+        layer.confirm('Send a sample crash alert for <b>' + self.esc(p.name) + '</b> (including its latest log lines) to <b>' +
+            self.esc(p.recipients.join(', ')) + '</b>?', { title: 'Test alert', icon: 3, closeBtn: 2 }, function (index) {
+            layer.close(index);
+            self.request('test_project_alert', { project: p.name }, function (res) { self.notify(res); }, 'Sending...');
+        });
+    },
+
+    /* ------------------------------------------------------------ Email / SMTP */
+    render_email: function () {
+        var self = this;
+        self.request('get_config', {}, function (res) {
+            if (!res.status) return self.fail(res);
+            var c = res.data, s = c.smtp;
+            var opt = function (v, label) {
+                return '<option value="' + v + '"' + (s.security === v ? ' selected' : '') + '>' + label + '</option>';
+            };
+            var html = '<div class="nw-form">' +
+                '<h3>SMTP server</h3>' +
+                self.line('SMTP host', '<input class="bt-input-text" id="nw_host" value="' + self.esc(s.host) + '" placeholder="smtp.gmail.com">') +
+                self.line('Encryption', '<select class="bt-input-text" id="nw_security">' +
+                    opt('ssl', 'SSL/TLS (port 465)') + opt('starttls', 'STARTTLS (port 587)') + opt('none', 'None (port 25)') + '</select>') +
+                self.line('Port', '<input class="bt-input-text nw-short" type="number" id="nw_port" value="' + self.esc(s.port) + '">') +
+                self.line('Username', '<input class="bt-input-text" id="nw_username" value="' + self.esc(s.username) + '" autocomplete="off">') +
+                self.line('Password', '<input class="bt-input-text" type="password" id="nw_password" autocomplete="new-password" placeholder="' +
+                    (c.has_password ? 'Saved - leave empty to keep it' : '') + '">',
+                    'Gmail / Outlook / Zoho with 2FA require an App Password.') +
+                self.line('From email', '<input class="bt-input-text" id="nw_from_email" value="' + self.esc(s.from_email) + '" placeholder="Empty = same as username">') +
+                self.line('From name', '<input class="bt-input-text" id="nw_from_name" value="' + self.esc(s.from_name) + '">') +
+                '<h3>Recipients</h3>' +
+                self.line('Default email', '<input class="bt-input-text" id="nw_default_email" value="' + self.esc(c.default_email) +
+                    '" placeholder="admin@example.com">',
+                    'Receives alerts for every project that has no email of its own. Separate multiple addresses with commas.') +
+                self.line('Copy default email', self.checkbox('nw_cc_default', c.cc_default,
+                    'Also send to the default email when a project has its own email')) +
+                '<div class="nw-actions">' +
+                '<button class="btn btn-success btn-sm" onclick="node_watchdog.save_email()">Save</button>' +
+                '<button class="btn btn-default btn-sm" onclick="node_watchdog.test_email()">Save &amp; send test email</button>' +
+                '</div></div>';
+            $('#nw_body').html(html);
+            $('#nw_security').change(function () {
+                $('#nw_port').val({ ssl: 465, starttls: 587, none: 25 }[$(this).val()]);
+            });
+        });
+    },
+
+    save_email: function (then) {
+        var self = this, pwd = $('#nw_password').val();
+        self.request('save_email_settings', {
+            host: $('#nw_host').val(),
+            security: $('#nw_security').val(),
+            port: $('#nw_port').val(),
+            username: $('#nw_username').val(),
+            password_b64: pwd ? self.b64(pwd) : '',
+            from_email: $('#nw_from_email').val(),
+            from_name: $('#nw_from_name').val(),
+            default_email: $('#nw_default_email').val(),
+            cc_default: $('#nw_cc_default').prop('checked') ? 1 : 0
+        }, function (res) {
+            if (!res.status) return self.notify(res);
+            if (pwd) $('#nw_password').val('').attr('placeholder', 'Saved - leave empty to keep it');
+            if (then) return then();
+            self.notify(res);
+        }, 'Saving...');
+    },
+
+    test_email: function () {
+        var self = this;
+        self.save_email(function () {
+            layer.prompt({ title: 'Send a test email to', value: $('#nw_default_email').val(), formType: 0 }, function (to, index) {
+                layer.close(index);
+                self.request('test_email', { to: to }, function (res) { self.notify(res); }, 'Sending test email...');
+            });
+        });
+    },
+
+    /* ------------------------------------------------------------ Settings */
+    render_settings: function () {
+        var self = this;
+        self.request('get_config', {}, function (res) {
+            if (!res.status) return self.fail(res);
+            var c = res.data, svc = c.service;
+            var num = function (id, value, unit) {
+                return '<input class="bt-input-text nw-short" type="number" min="0" id="' + id + '" value="' + self.esc(value) + '"> ' + unit;
+            };
+            var html = '<div class="nw-form">' +
+                '<h3>Monitoring</h3>' +
+                self.line('Check interval', num('nw_interval', c.interval, 'seconds'), 'How often projects are checked (minimum 10).') +
+                self.line('Confirm delay', num('nw_confirm_delay', c.confirm_delay, 'seconds'),
+                    'Re-check after this delay before alerting, so a restart from aaPanel is not reported as a crash.') +
+                self.line('Log lines in email', num('nw_log_lines', c.log_lines, 'lines'), 'Last lines of the project log attached to the alert.') +
+                self.line('Repeat alert every', num('nw_repeat_minutes', c.repeat_minutes, 'minutes'), '0 = alert only once per crash.') +
+                '<h3>Notifications</h3>' +
+                self.line('Recovery', self.checkbox('nw_notify_recovery', c.notify_recovery, 'Email when a crashed project is running again')) +
+                self.line('Manual stop', self.checkbox('nw_notify_manual_stop', c.notify_manual_stop, 'Email when a project is stopped from aaPanel')) +
+                self.line('Restart', self.checkbox('nw_notify_restart', c.notify_restart, 'Email when the PID of a running project changes (restart)')) +
+                '<div class="nw-actions"><button class="btn btn-success btn-sm" onclick="node_watchdog.save_settings()">Save</button></div>' +
+                '<h3>Watchdog service</h3>' +
+                self.line('Status', (svc.running ? self.badge('nw-ok', 'Running') + ' &nbsp;PID ' + svc.pid : self.badge('nw-bad', 'Stopped')) +
+                    ' &nbsp;<span class="nw-muted">(' + self.esc(svc.mode) + ')</span>') +
+                '<div class="nw-actions">' +
+                (svc.running
+                    ? '<button class="btn btn-default btn-sm" onclick="node_watchdog.service(\'restart\')">Restart</button>' +
+                      '<button class="btn btn-danger btn-sm" onclick="node_watchdog.service(\'stop\')">Stop</button>'
+                    : '<button class="btn btn-success btn-sm" onclick="node_watchdog.service(\'start\')">Start</button>') +
+                '</div></div>';
+            $('#nw_body').html(html);
+        });
+    },
+
+    save_settings: function () {
+        var self = this, flag = function (id) { return $('#' + id).prop('checked') ? 1 : 0; };
+        self.request('save_settings', {
+            interval: $('#nw_interval').val(),
+            confirm_delay: $('#nw_confirm_delay').val(),
+            log_lines: $('#nw_log_lines').val(),
+            repeat_minutes: $('#nw_repeat_minutes').val(),
+            notify_recovery: flag('nw_notify_recovery'),
+            notify_manual_stop: flag('nw_notify_manual_stop'),
+            notify_restart: flag('nw_notify_restart')
+        }, function (res) { self.notify(res, function () { self.render_settings(); }); }, 'Saving...');
+    },
+
+    service: function (action) {
+        var self = this;
+        self.request('service_control', { op: action }, function (res) {
+            self.notify(res);
+            self.tab(self.current);
+        }, 'Please wait...');
+    },
+
+    /* ------------------------------------------------------------ Event log */
+    render_events: function () {
+        var self = this;
+        self.request('get_events', { limit: 300 }, function (res) {
+            if (!res.status) return self.fail(res);
+            var html = '<div class="nw-toolbar"><div class="nw-meta"><span>Latest 300 events</span></div><div>' +
+                '<button class="btn btn-default btn-sm" onclick="node_watchdog.render_events()">Refresh</button>' +
+                '<button class="btn btn-default btn-sm" onclick="node_watchdog.clear_events()">Clear</button></div></div>' +
+                '<div class="divtable"><table class="table table-hover nw-table"><thead><tr>' +
+                '<th style="width:150px">Time</th><th>Project</th><th>Event</th><th>Details</th></tr></thead><tbody>';
+            if (!res.data.length) html += '<tr><td colspan="4" style="text-align:center">No events yet</td></tr>';
+            $.each(res.data, function (_, e) {
+                var cls = e.level === 'error' ? 'nw-err' : e.level === 'warning' ? 'nw-warn' : '';
+                html += '<tr><td>' + self.fmt_time(e.time) + '</td><td>' + self.esc(e.project) + '</td>' +
+                    '<td class="' + cls + '">' + self.esc(e.event) + '</td>' +
+                    '<td><div class="nw-detail">' + self.esc(e.detail) + '</div></td></tr>';
+            });
+            html += '</tbody></table></div>';
+            $('#nw_body').html(html);
+        });
+    },
+
+    clear_events: function () {
+        var self = this;
+        layer.confirm('Clear the whole event log?', { title: 'Clear log', icon: 3, closeBtn: 2 }, function (index) {
+            layer.close(index);
+            self.request('clear_events', {}, function (res) { self.notify(res, function () { self.render_events(); }); });
+        });
+    }
+};
+
+(function () {
+    var box = $('#nw_body').closest('.layui-layer');
+    if (box.length) box.css({ width: '1000px', left: Math.max(0, ($(window).width() - 1000) / 2) + 'px' });
+    $('.nw-menu p').click(function () { node_watchdog.tab($(this).data('tab')); });
+    node_watchdog.tab('projects');
+})();
+</script>
