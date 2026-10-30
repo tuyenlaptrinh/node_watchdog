@@ -32,6 +32,7 @@
     <div class="bt-w-main nw-main">
         <div class="bt-w-menu nw-menu">
             <p class="bgw" data-tab="projects">Projects</p>
+            <p data-tab="services">Services</p>
             <p data-tab="email">Email / SMTP</p>
             <p data-tab="settings">Settings</p>
             <p data-tab="events">Event log</p>
@@ -47,6 +48,7 @@ var node_watchdog = {
     plugin: 'node_watchdog',
     current: 'projects',
     projects: [],
+    services: [],
 
     request: function (method, args, callback, loading) {
         var idx = loading === false ? null : layer.msg(loading || 'Loading...', { icon: 16, time: 0, shade: 0.3 });
@@ -135,15 +137,30 @@ var node_watchdog = {
                 html += '<div class="nw-alert">The watchdog service is not running, so projects are not being monitored. ' +
                     '<a class="btlink" href="javascript:;" onclick="node_watchdog.service(\'start\')">Start it now</a></div>';
             }
+            if (d.watch_paused) {
+                html += '<div class="nw-alert">Monitoring is <b>paused</b> — no project or service checks until you resume. ' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.set_pause(0)">Resume now</a></div>';
+            }
             if (d.pending_emails) {
                 html += '<div class="nw-alert">' + d.pending_emails + ' alert email(s) are waiting to be retried. ' +
                     'See the <a class="btlink" href="javascript:;" onclick="node_watchdog.tab(\'events\')">event log</a>.</div>';
             }
+            var downSvcs = (d.services || []).filter(function (s) { return s.crashed; });
+            if (downSvcs.length) {
+                html += '<div class="nw-alert">' + downSvcs.length + ' system service(s) look down: ' +
+                    self.esc(downSvcs.map(function (s) { return s.name; }).join(', ')) + '. ' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.tab(\'services\')">Open Services</a></div>';
+            }
             html += '<div class="nw-toolbar"><div class="nw-meta">' +
-                '<span>Service: ' + (d.service.running ? self.badge('nw-ok', 'Running') : self.badge('nw-bad', 'Stopped')) + '</span>' +
+                '<span>Watchdog: ' + (d.service.running ? self.badge('nw-ok', 'Running') : self.badge('nw-bad', 'Stopped')) + '</span>' +
+                '<span>Checks: ' + (d.watch_paused ? self.badge('nw-gray', 'Paused') : self.badge('nw-ok', 'Active')) + '</span>' +
                 '<span>Last check: ' + (d.last_check ? self.ago(d.last_check) : 'never') + '</span>' +
                 '<span>Default email: ' + (d.default_email ? self.esc(d.default_email) : '<i>not set</i>') + '</span>' +
-                '</div><div><button class="btn btn-default btn-sm" onclick="node_watchdog.render_projects()">Refresh</button></div></div>';
+                '</div><div>' +
+                (d.watch_paused
+                    ? '<button class="btn btn-success btn-sm" onclick="node_watchdog.set_pause(0)">Resume checks</button>'
+                    : '<button class="btn btn-default btn-sm" onclick="node_watchdog.set_pause(1)">Pause checks</button>') +
+                '<button class="btn btn-default btn-sm" onclick="node_watchdog.render_projects()">Refresh</button></div></div>';
 
             html += '<div class="divtable"><table class="table table-hover nw-table"><thead><tr>' +
                 '<th>Project</th><th>Status</th><th>PID</th><th>Memory</th><th>Monitor</th><th>Alert email</th>' +
@@ -283,6 +300,89 @@ var node_watchdog = {
         });
     },
 
+    /* ------------------------------------------------------------ Services */
+    render_services: function () {
+        var self = this;
+        self.request('get_services', {}, function (res) {
+            if (!res.status) return self.fail(res);
+            var d = res.data, html = '';
+            self.services = d.services || [];
+            if (d.watch_paused) {
+                html += '<div class="nw-alert">All monitoring is paused (projects + services). ' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.set_pause(0)">Resume</a></div>';
+            }
+            if (!d.smtp_ready || !d.default_email) {
+                html += '<div class="nw-alert">Service alerts use the <b>default email</b>. ' +
+                    '<a class="btlink" href="javascript:;" onclick="node_watchdog.tab(\'email\')">Configure SMTP / default email</a></div>';
+            }
+            html += '<div class="nw-toolbar"><div class="nw-meta">' +
+                '<span>Checks: ' + (d.watch_paused ? self.badge('nw-gray', 'Paused') : self.badge('nw-ok', 'Active')) + '</span>' +
+                '<span>Last check: ' + (d.last_check ? self.ago(d.last_check) : 'never') + '</span>' +
+                '</div><div>' +
+                (d.watch_paused
+                    ? '<button class="btn btn-success btn-sm" onclick="node_watchdog.set_pause(0)">Resume all checks</button>'
+                    : '<button class="btn btn-warning btn-sm" onclick="node_watchdog.set_pause(1)">Pause all checks</button>') +
+                '<button class="btn btn-default btn-sm" onclick="node_watchdog.render_services()">Refresh</button></div></div>';
+            html += '<p class="nw-muted" style="margin:0 0 10px">Nginx, databases and each installed PHP version are detected automatically. ' +
+                'aaPanel itself is opt-in. Alerts go to the default email.</p>';
+            html += '<div class="divtable"><table class="table table-hover nw-table"><thead><tr>' +
+                '<th>Service</th><th>Status</th><th>PID</th><th>Monitor</th><th>Check</th>' +
+                '<th style="text-align:right">Action</th></tr></thead><tbody>';
+            if (!self.services.length) {
+                html += '<tr><td colspan="6" style="text-align:center">No services detected</td></tr>';
+            }
+            $.each(self.services, function (i, s) {
+                var status;
+                if (!s.enabled) status = self.badge('nw-gray', 'Ignored');
+                else if (s.running) status = self.badge('nw-ok', 'Running');
+                else if (s.crashed) status = self.badge('nw-bad', 'Down') +
+                    (s.down_since ? '<br><small class="nw-muted">' + self.ago(s.down_since) + '</small>' : '');
+                else status = self.badge('nw-gray', 'Stopped');
+                html += '<tr>' +
+                    '<td><b>' + self.esc(s.name) + '</b><br><small class="nw-muted">' + self.esc(s.kind) + '</small></td>' +
+                    '<td>' + status + '</td>' +
+                    '<td>' + (s.enabled && s.running && s.pid ? s.pid : '-') + '</td>' +
+                    '<td>' + (s.enabled ? self.badge('nw-ok', 'On') : self.badge('nw-gray', 'Off')) + '</td>' +
+                    '<td><small class="nw-muted" title="' + self.esc(s.detail || '') + '">' +
+                    self.esc(s.source || '-') + '</small></td>' +
+                    '<td style="text-align:right"><a class="btlink" href="javascript:;" onclick="node_watchdog.toggle_service(' +
+                    i + ')">' + (s.enabled ? 'Disable' : 'Enable') + '</a></td></tr>';
+            });
+            html += '</tbody></table></div>';
+            $('#nw_body').html(html);
+        });
+    },
+
+    toggle_service: function (i) {
+        var self = this, s = self.services[i];
+        if (!s) return;
+        self.request('save_service', {
+            service_id: s.id,
+            enabled: s.enabled ? 0 : 1
+        }, function (res) {
+            self.notify(res, function () { self.render_services(); });
+        }, 'Saving...');
+    },
+
+    set_pause: function (paused) {
+        var self = this;
+        var go = function () {
+            self.request('set_pause', { paused: paused ? 1 : 0 }, function (res) {
+                self.notify(res, function () { self.tab(self.current); });
+            }, 'Please wait...');
+        };
+        if (paused) {
+            layer.confirm('Temporarily pause <b>all</b> monitoring (Node.js projects + system services)? ' +
+                'No crash emails will be sent until you resume.',
+                { title: 'Pause checks', icon: 3, closeBtn: 2 }, function (index) {
+                    layer.close(index);
+                    go();
+                });
+        } else {
+            go();
+        }
+    },
+
     /* ------------------------------------------------------------ Settings */
     render_settings: function () {
         var self = this;
@@ -294,13 +394,17 @@ var node_watchdog = {
             };
             var html = '<div class="nw-form">' +
                 '<h3>Monitoring</h3>' +
-                self.line('Check interval', num('nw_interval', c.interval, 'seconds'), 'How often projects are checked (minimum 10).') +
+                self.line('Check interval', num('nw_interval', c.interval, 'seconds'), 'How often projects and services are checked (minimum 10).') +
                 self.line('Confirm delay', num('nw_confirm_delay', c.confirm_delay, 'seconds'),
                     'Re-check after this delay before alerting, so a restart from aaPanel is not reported as a crash.') +
                 self.line('Log lines in email', num('nw_log_lines', c.log_lines, 'lines'), 'Last lines of the project log attached to the alert.') +
                 self.line('Repeat alert every', num('nw_repeat_minutes', c.repeat_minutes, 'minutes'), '0 = alert only once per crash.') +
+                self.line('Pause checks', (c.watch_paused ? self.badge('nw-gray', 'Paused') : self.badge('nw-ok', 'Active')) +
+                    ' &nbsp;<a class="btlink" href="javascript:;" onclick="node_watchdog.set_pause(' +
+                    (c.watch_paused ? 0 : 1) + ')">' + (c.watch_paused ? 'Resume' : 'Pause all') + '</a>',
+                    'Temporarily stops all project and service checks (useful during maintenance).') +
                 '<h3>Notifications</h3>' +
-                self.line('Recovery', self.checkbox('nw_notify_recovery', c.notify_recovery, 'Email when a crashed project is running again')) +
+                self.line('Recovery', self.checkbox('nw_notify_recovery', c.notify_recovery, 'Email when a crashed project or service is running again')) +
                 self.line('Manual stop', self.checkbox('nw_notify_manual_stop', c.notify_manual_stop, 'Email when a project is stopped from aaPanel')) +
                 self.line('Restart', self.checkbox('nw_notify_restart', c.notify_restart, 'Email when the PID of a running project changes (restart)')) +
                 '<div class="nw-actions"><button class="btn btn-success btn-sm" onclick="node_watchdog.save_settings()">Save</button></div>' +

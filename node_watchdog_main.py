@@ -43,6 +43,32 @@ def _bool(get, key):
     return _str(get, key).lower() in ('1', 'true', 'on', 'yes')
 
 
+def _service_rows(cfg, state):
+    tracked = state.get('services', {}) if isinstance(state, dict) else {}
+    if not isinstance(tracked, dict):
+        tracked = {}
+    rows = []
+    for svc in core.discover_services():
+        default_on = svc['id'] != 'panel'
+        enabled = core.service_enabled(cfg, svc['id'], default=default_on)
+        live = core.probe_service(svc) if enabled else {'running': False, 'pid': None, 'detail': '', 'source': ''}
+        prev = tracked.get(svc['id']) or {}
+        crashed = enabled and (not live['running']) and prev.get('down_kind') == 'crash'
+        rows.append({
+            'id': svc['id'],
+            'name': svc['name'],
+            'kind': svc['kind'],
+            'enabled': enabled,
+            'running': bool(live.get('running')) if enabled else None,
+            'pid': live.get('pid') if enabled else None,
+            'source': live.get('source') if enabled else None,
+            'detail': ((live.get('detail') or '')[:300] if enabled else ''),
+            'crashed': crashed,
+            'down_since': prev.get('down_since') if crashed else None,
+        })
+    return rows
+
+
 class node_watchdog_main(object):
 
     def get_overview(self, get):
@@ -75,19 +101,54 @@ class node_watchdog_main(object):
             })
         return _ok(data={
             'projects': rows,
+            'services': _service_rows(cfg, state),
             'service': core.daemon_status(),
             'last_check': state.get('last_check') if isinstance(state, dict) else None,
             'pending_emails': len(state.get('pending') or []) if isinstance(state, dict) else 0,
             'smtp_ready': core.smtp_ready(cfg),
             'default_email': cfg.get('default_email', ''),
+            'watch_paused': bool(cfg.get('watch_paused')),
             'now': int(time.time()),
         })
+
+    def get_services(self, get):
+        cfg = core.load_config()
+        state = core.read_json(core.STATE_FILE, {})
+        return _ok(data={
+            'services': _service_rows(cfg, state),
+            'watch_paused': bool(cfg.get('watch_paused')),
+            'default_email': cfg.get('default_email', ''),
+            'smtp_ready': core.smtp_ready(cfg),
+            'service': core.daemon_status(),
+            'last_check': state.get('last_check') if isinstance(state, dict) else None,
+        })
+
+    def save_service(self, get):
+        sid = _str(get, 'service_id')
+        known = {s['id'] for s in core.discover_services()}
+        if sid not in known:
+            return _err('Service not found')
+        cfg = core.load_config()
+        cfg.setdefault('services', {})
+        cfg['services'][sid] = {'enabled': _bool(get, 'enabled')}
+        core.save_config(cfg)
+        return _ok('Saved settings for %s' % sid)
+
+    def set_pause(self, get):
+        cfg = core.load_config()
+        paused = _bool(get, 'paused')
+        cfg['watch_paused'] = paused
+        core.save_config(cfg)
+        core.add_event('-', 'monitoring_paused' if paused else 'monitoring_resumed',
+                       'All checks temporarily paused' if paused else 'Monitoring resumed')
+        return _ok('Monitoring paused' if paused else 'Monitoring resumed',
+                   data={'watch_paused': paused})
 
     def get_config(self, get):
         cfg = core.load_config()
         smtp = dict(cfg['smtp'])
         has_password = bool(smtp.pop('password', ''))
-        data = {k: v for k, v in cfg.items() if k not in ('smtp', 'projects')}
+        data = {k: v for k, v in cfg.items() if k not in ('smtp', 'projects', 'services')}
         data.update(smtp=smtp, has_password=has_password, service=core.daemon_status())
         return _ok(data=data)
 

@@ -58,8 +58,19 @@ DEFAULT_CONFIG = {
     'notify_recovery': True,
     'notify_manual_stop': False,
     'notify_restart': False,
+    'watch_paused': False,
+    # Per-service toggles: { "nginx": {"enabled": true}, "php-84": {"enabled": false}, ... }
+    # Missing id = enabled by default once discovered.
+    'services': {},
     'projects': {},
 }
+
+PANEL_PID_FILES = (
+    PANEL_DIR + '/logs/panel.pid',
+    PANEL_DIR + '/pids/panel.pid',
+)
+SERVER_ROOT = '/www/server'
+INITD_DIR = '/etc/init.d'
 
 LOG_HINTS = (
     (r'JavaScript heap out of memory|Allocation failed - JavaScript heap',
@@ -103,11 +114,26 @@ def load_config():
         for key, value in data.items():
             if key == 'smtp' and isinstance(value, dict):
                 cfg['smtp'].update(value)
+            elif key == 'services' and isinstance(value, dict):
+                cfg['services'] = value
             else:
                 cfg[key] = value
     if not isinstance(cfg.get('projects'), dict):
         cfg['projects'] = {}
+    if not isinstance(cfg.get('services'), dict):
+        cfg['services'] = {}
+    # Migrate legacy watch_panel (pre-1.1.0) into services.panel.enabled
+    if 'watch_panel' in (data or {}) and 'panel' not in cfg['services']:
+        cfg['services']['panel'] = {'enabled': bool(data.get('watch_panel'))}
+    cfg.pop('watch_panel', None)
     return cfg
+
+
+def service_enabled(cfg, service_id, default=True):
+    entry = (cfg.get('services') or {}).get(service_id)
+    if not isinstance(entry, dict):
+        return default
+    return bool(entry.get('enabled', default))
 
 
 def save_config(cfg):
@@ -483,15 +509,17 @@ EMAIL_KINDS = {
 }
 
 
-def build_email(kind, name, rows, log_file=None, log_tail=None, test=False):
+def build_email(kind, name, rows, log_file=None, log_tail=None, test=False, entity=None):
     tag, verb, color = EMAIL_KINDS[kind]
     server = server_label()
-    subject = '[%s] Node.js project "%s" %s - %s' % (tag, name, verb, socket.gethostname())
+    label = entity or 'Node.js project "%s"' % name
+    subject = '[%s] %s %s - %s' % (tag, label, verb, socket.gethostname())
     if test:
         subject = '[TEST] ' + subject
-    rows = [('Project', name), ('Server', server)] + [(k, v) for k, v in rows if v not in (None, '')]
+    title_key = 'Service' if entity else 'Project'
+    rows = [(title_key, name), ('Server', server)] + [(k, v) for k, v in rows if v not in (None, '')]
 
-    text = ['Node.js project "%s" %s.' % (name, verb), '']
+    text = ['%s %s.' % (label, verb), '']
     if test:
         text.insert(0, 'THIS IS A TEST MESSAGE sent from the aaPanel Node Watchdog plugin.\n')
     width = max(len(k) for k, _ in rows)
@@ -520,11 +548,204 @@ def build_email(kind, name, rows, log_file=None, log_tail=None, test=False):
     html_body = (
         '<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#333;max-width:900px">'
         '%s<div style="background:%s;color:#fff;padding:12px 16px;border-radius:4px 4px 0 0;font-size:16px">'
-        '<b>[%s]</b> Node.js project <b>%s</b> %s</div>'
+        '<b>[%s]</b> %s %s</div>'
         '<table style="border-collapse:collapse;width:100%%;margin-top:0">%s</table>%s'
         '<p style="color:#999;font-size:11px;margin-top:20px">Sent by aaPanel Node Watchdog on %s</p></div>'
-        % (test_html, color, esc(tag), esc(name), esc(verb), cells, log_html, esc(server)))
+        % (test_html, color, esc(tag), esc(label), esc(verb), cells, log_html, esc(server)))
     return subject, '\n'.join(text), html_body
+
+
+# ---------------------------------------------------------------- system services (nginx / DB / PHP / panel)
+
+def parse_service_status(output):
+    """Return True/False when status output is clear, else None."""
+    text = (output or '').strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if re.search(r'not\s+running|is\s+stopped|\binactive\b|failed\s+to\s+start|no such process', lower):
+        return False
+    if re.search(r'already\s+running|is\s+running|\(pid\s+\d+\)|active\s*\(running\)|\bactive\b', lower):
+        return True
+    return None
+
+
+parse_bt_status = parse_service_status  # backwards-compatible alias
+
+
+def format_php_version(folder):
+    """aaPanel stores PHP as 74, 80, 81, 82, 83, 84 → 7.4, 8.0, …"""
+    folder = str(folder or '')
+    if len(folder) == 2 and folder.isdigit():
+        return '%s.%s' % (folder[0], folder[1])
+    if len(folder) == 3 and folder.isdigit():
+        return '%s.%s' % (folder[0], folder[1:])
+    return folder
+
+
+def _pid_alive(pid):
+    try:
+        with open('/proc/%d/stat' % pid, 'r') as f:
+            data = f.read()
+        state = data[data.rindex(')') + 2:].split()[0]
+        return state not in ('Z', 'X', 'x')
+    except (IOError, OSError, ValueError, IndexError):
+        return False
+
+
+def _read_pid_file(path):
+    try:
+        with open(path, 'r') as f:
+            pid = int(f.read().strip().split()[0])
+        return pid if _pid_alive(pid) else None
+    except (IOError, OSError, ValueError, IndexError):
+        return None
+
+
+def _panel_pid_from_file():
+    for path in PANEL_PID_FILES:
+        pid = _read_pid_file(path)
+        if not pid:
+            continue
+        try:
+            with open('/proc/%d/cmdline' % pid, 'rb') as f:
+                cmd = f.read().lower()
+            if b'bt-panel' in cmd or b'btpanel' in cmd or b'panel' in cmd:
+                return pid
+        except (IOError, OSError):
+            continue
+    return None
+
+
+def _panel_pid_from_proc():
+    try:
+        entries = os.listdir('/proc')
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open('/proc/%s/cmdline' % entry, 'rb') as f:
+                cmd = f.read().lower()
+        except (IOError, OSError):
+            continue
+        if b'bt-panel' in cmd or b'btpanel' in cmd:
+            return int(entry)
+    return None
+
+
+def _initd_script(name):
+    path = os.path.join(INITD_DIR, name)
+    return path if os.path.isfile(path) else None
+
+
+def probe_initd(script_name, pid_file=None):
+    """Probe an aaPanel-style /etc/init.d/<name> status script."""
+    script = _initd_script(script_name)
+    detail, source = '', 'missing'
+    parsed = None
+    if script:
+        code, out = run_cmd([script, 'status'], timeout=20)
+        detail = (out or '').strip()[-1500:]
+        parsed = parse_service_status(out)
+        source = script
+        if parsed is None and code == 0 and detail:
+            parsed = True
+        elif parsed is None and code not in (0, -1) and detail:
+            parsed = False
+    pid = _read_pid_file(pid_file) if pid_file else None
+    if parsed is not None:
+        return {'running': parsed, 'pid': pid if parsed else None,
+                'detail': detail or ('%s status' % script_name), 'source': source}
+    if pid:
+        return {'running': True, 'pid': pid, 'detail': detail or 'PID file alive', 'source': 'pid file'}
+    return {'running': False, 'pid': None,
+            'detail': detail or ('%s is not installed or not running' % script_name),
+            'source': source}
+
+
+def probe_panel():
+    """Check whether the aaPanel web service is running (bt status + fallbacks)."""
+    code, out = run_cmd(['bt', 'status'], timeout=20)
+    parsed = parse_service_status(out)
+    detail = (out or '').strip()[-1500:]
+    pid = _panel_pid_from_file() or _panel_pid_from_proc()
+    if parsed is not None:
+        return {
+            'running': parsed,
+            'pid': pid if parsed else None,
+            'detail': detail or ('bt status exit %s' % code),
+            'source': 'bt status',
+        }
+    if pid:
+        return {'running': True, 'pid': pid, 'detail': detail or 'BT-Panel process found', 'source': 'process'}
+    if detail:
+        return {'running': False, 'pid': None, 'detail': detail, 'source': 'bt status'}
+    return {'running': False, 'pid': None, 'detail': 'bt status unavailable and no BT-Panel process found',
+            'source': 'fallback'}
+
+
+def discover_services():
+    """Return installed stack services that aaPanel typically manages."""
+    found = []
+    found.append({
+        'id': 'panel', 'name': 'aaPanel', 'kind': 'panel',
+        'entity': 'aaPanel panel service', 'sort': 10,
+    })
+    if _initd_script('nginx') or os.path.isdir(SERVER_ROOT + '/nginx'):
+        found.append({
+            'id': 'nginx', 'name': 'Nginx', 'kind': 'nginx',
+            'entity': 'Nginx service', 'sort': 20,
+            'initd': 'nginx', 'pid_file': SERVER_ROOT + '/nginx/logs/nginx.pid',
+        })
+    if _initd_script('httpd') or os.path.isdir(SERVER_ROOT + '/apache'):
+        found.append({
+            'id': 'apache', 'name': 'Apache', 'kind': 'apache',
+            'entity': 'Apache service', 'sort': 25,
+            'initd': 'httpd', 'pid_file': SERVER_ROOT + '/apache/logs/httpd.pid',
+        })
+    if _initd_script('mysqld') or os.path.isdir(SERVER_ROOT + '/mysql'):
+        found.append({
+            'id': 'mysql', 'name': 'MySQL / MariaDB', 'kind': 'mysql',
+            'entity': 'MySQL / MariaDB service', 'sort': 30,
+            'initd': 'mysqld',
+            'pid_file': SERVER_ROOT + '/mysql/mysql.pid',
+        })
+    if _initd_script('pgsql') or os.path.isdir(SERVER_ROOT + '/pgsql'):
+        found.append({
+            'id': 'pgsql', 'name': 'PostgreSQL', 'kind': 'pgsql',
+            'entity': 'PostgreSQL service', 'sort': 35,
+            'initd': 'pgsql',
+        })
+    php_root = SERVER_ROOT + '/php'
+    if os.path.isdir(php_root):
+        try:
+            versions = sorted(os.listdir(php_root))
+        except OSError:
+            versions = []
+        for ver in versions:
+            if not ver.isdigit():
+                continue
+            initd = 'php-fpm-%s' % ver
+            if not _initd_script(initd):
+                continue
+            label = format_php_version(ver)
+            found.append({
+                'id': 'php-%s' % ver, 'name': 'PHP %s' % label, 'kind': 'php',
+                'entity': 'PHP %s (php-fpm) service' % label, 'sort': 40 + int(ver),
+                'version': ver, 'initd': initd,
+                'pid_file': '%s/%s/var/run/php-fpm.pid' % (php_root, ver),
+            })
+    found.sort(key=lambda s: (s.get('sort', 100), s['id']))
+    return found
+
+
+def probe_service(svc):
+    kind = svc.get('kind')
+    if kind == 'panel':
+        return probe_panel()
+    return probe_initd(svc.get('initd') or svc['id'], svc.get('pid_file'))
 
 
 # ---------------------------------------------------------------- watchdog
@@ -535,6 +756,12 @@ class Watchdog(object):
         self.state = state if isinstance(state, dict) else {}
         self.state.setdefault('projects', {})
         self.state.setdefault('pending', [])
+        self.state.setdefault('services', {})
+        # Drop legacy single-panel blob if present (migrated into services.panel)
+        if 'panel' in self.state and 'panel' not in self.state['services']:
+            legacy = self.state.pop('panel')
+            if isinstance(legacy, dict) and legacy:
+                self.state['services']['panel'] = legacy
 
     def save(self):
         write_json(STATE_FILE, self.state)
@@ -542,11 +769,20 @@ class Watchdog(object):
     def run_once(self):
         cfg = load_config()
         now = time.time()
-        projects = list_node_projects()
-        snap = ProcSnapshot()
         boot_id = read_boot_id()
         rebooted = bool(self.state.get('boot_id')) and self.state.get('boot_id') != boot_id
         self.state['boot_id'] = boot_id
+
+        if cfg.get('watch_paused'):
+            self.state['last_check'] = int(now)
+            self.state['paused'] = True
+            self.flush(cfg)
+            self.save()
+            return
+
+        self.state['paused'] = False
+        projects = list_node_projects()
+        snap = ProcSnapshot()
         tracked = self.state['projects']
         suspects = []
 
@@ -578,10 +814,95 @@ class Watchdog(object):
         for name in list(tracked):
             if name not in projects:
                 del tracked[name]
+
+        self._check_services(cfg, now, rebooted)
+
         self.state['last_check'] = int(time.time())
         self.state['project_count'] = len(projects)
         self.flush(cfg)
         self.save()
+
+    def _check_services(self, cfg, now, rebooted):
+        discovered = {s['id']: s for s in discover_services()}
+        tracked = self.state.setdefault('services', {})
+        for sid, svc in discovered.items():
+            # Panel defaults to OFF (opt-in); nginx/db/php default ON when installed
+            default_on = sid != 'panel'
+            if not service_enabled(cfg, sid, default=default_on):
+                tracked.pop(sid, None)
+                continue
+            self._check_one_service(cfg, svc, tracked, now, rebooted)
+        for sid in list(tracked):
+            if sid not in discovered:
+                del tracked[sid]
+
+    def _check_one_service(self, cfg, svc, tracked, now, rebooted):
+        sid = svc['id']
+        st = probe_service(svc)
+        prev = tracked.get(sid)
+        recipients = parse_emails(cfg.get('default_email'))
+        entity = svc.get('entity') or svc['name']
+        label = svc['name']
+
+        if prev is None:
+            tracked[sid] = {
+                'running': st['running'], 'pid': st.get('pid'),
+                'last_seen': now if st['running'] else None,
+                'down_since': None, 'down_kind': None, 'alerted': False, 'last_alert': 0,
+                'detail': st.get('detail', ''), 'source': st.get('source', ''),
+            }
+            return
+
+        if st['running']:
+            if not prev.get('running'):
+                add_event(label, 'running', 'source=%s pid=%s' % (st.get('source'), st.get('pid')))
+                if prev.get('alerted') and cfg.get('notify_recovery'):
+                    self.queue(cfg, label, 'recovered', [
+                        ('Recovered at', fmt_time(now)),
+                        ('Down since', fmt_time(prev.get('down_since'))),
+                        ('Downtime', fmt_duration(now - prev['down_since']) if prev.get('down_since') else '-'),
+                        ('Check', st.get('source')),
+                        ('PID', st.get('pid')),
+                    ], entity=entity, recipients=recipients)
+                prev.update(down_since=None, down_kind=None, alerted=False, last_alert=0)
+            prev.update(running=True, pid=st.get('pid'), last_seen=now,
+                        detail=st.get('detail', ''), source=st.get('source', ''))
+            return
+
+        if prev.get('running'):
+            delay = max(0, min(60, int(cfg.get('confirm_delay') or 0)))
+            if delay and not rebooted:
+                time.sleep(delay)
+                st = probe_service(svc)
+                if st['running']:
+                    prev.update(running=True, pid=st.get('pid'), last_seen=now,
+                                detail=st.get('detail', ''), source=st.get('source', ''))
+                    return
+            prev.update(running=False, down_since=now, down_kind='crash', alerted=False, last_alert=0,
+                        detail=st.get('detail', ''), source=st.get('source', ''), pid=None)
+            add_event(label, 'crashed', (st.get('detail') or '')[:500], 'error')
+            note = ('Watchdog runs as a separate systemd unit, so this email can still be delivered '
+                    'even if aaPanel or another stack service is down.')
+            self.queue(cfg, label, 'crash', [
+                ('Detected at', fmt_time(now)),
+                ('Last seen running', fmt_time(prev.get('last_seen'))),
+                ('Check method', st.get('source')),
+                ('Status detail', st.get('detail') or '-'),
+                ('Note', note),
+            ], entity=entity, recipients=recipients)
+            prev.update(alerted=True, last_alert=now)
+            return
+
+        repeat = int(cfg.get('repeat_minutes') or 0)
+        if (repeat > 0 and prev.get('down_kind') == 'crash' and prev.get('alerted')
+                and now - (prev.get('last_alert') or 0) >= repeat * 60):
+            self.queue(cfg, label, 'reminder', [
+                ('Down since', fmt_time(prev.get('down_since'))),
+                ('Downtime', fmt_duration(now - (prev.get('down_since') or now))),
+                ('Status detail', prev.get('detail') or '-'),
+            ], entity=entity, recipients=recipients)
+            prev['last_alert'] = now
+        prev.update(detail=st.get('detail', ''), source=st.get('source', ''))
 
     @staticmethod
     def _baseline(st, now):
@@ -711,12 +1032,12 @@ class Watchdog(object):
         ]
         return {'causes': causes, 'hints': hints, 'rows': rows, 'log_file': log_file, 'log_tail': log_tail}
 
-    def queue(self, cfg, name, kind, rows, log_file=None, log_tail=None):
-        recipients = recipients_for(cfg, name)
+    def queue(self, cfg, name, kind, rows, log_file=None, log_tail=None, entity=None, recipients=None):
+        recipients = recipients if recipients is not None else recipients_for(cfg, name)
         if not recipients:
             add_event(name, 'email_skipped', 'No recipient: set a default email or a project email.', 'warning')
             return
-        subject, text, html_body = build_email(kind, name, rows, log_file, log_tail)
+        subject, text, html_body = build_email(kind, name, rows, log_file, log_tail, entity=entity)
         self.state['pending'].append({'project': name, 'kind': kind, 'to': recipients, 'subject': subject,
                                       'text': text, 'html': html_body, 'attempts': 0,
                                       'created': time.time(), 'next_try': 0})
